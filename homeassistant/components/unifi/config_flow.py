@@ -239,7 +239,8 @@ class UnifiOptionsFlowHandler(config_entries.OptionsFlow):
             | {
                 wlan["name"]
                 for ap in self.controller.api.devices.values()
-                for wlan in ap.raw.get("wlan_overrides", [])
+                for wlan in ap.wlan_overrides
+                if "name" in wlan
             }
         )
         ssid_filter = {ssid: ssid for ssid in sorted(list(ssids))}
