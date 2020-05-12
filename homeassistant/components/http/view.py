@@ -62,14 +62,13 @@ class HomeAssistantView:
         response.enable_compression()
         return response
 
-    def json_message(
-        self, message, status_code=HTTP_OK, message_code=None, headers=None
-    ):
+    @staticmethod
+    def json_message(message, status_code=HTTP_OK, message_code=None, headers=None):
         """Return a JSON message response."""
         data = {"message": message}
         if message_code is not None:
             data["code"] = message_code
-        return self.json(data, status_code, headers=headers)
+        return HomeAssistantView.json(data, status_code, headers=headers)
 
     def register(self, app, router):
         """Register the view with a router."""
@@ -83,7 +82,7 @@ class HomeAssistantView:
             if not handler:
                 continue
 
-            handler = request_handler_factory(self, handler)
+            handler = self.get_request_handler_factory()(self, handler)
 
             for url in urls:
                 routes.append(router.add_route(method, url, handler))
@@ -93,6 +92,13 @@ class HomeAssistantView:
 
         for route in routes:
             app["allow_cors"](route)
+
+    def get_request_handler_factory(self):
+        """Return the request_handle_factory function to be used during registering the view.
+
+        A view might want to use a different factory - overriding this method will allow that.
+        """
+        return request_handler_factory
 
 
 def request_handler_factory(view, handler):
@@ -130,24 +136,27 @@ def request_handler_factory(view, handler):
         except exceptions.Unauthorized:
             raise HTTPUnauthorized()
 
-        if isinstance(result, web.StreamResponse):
-            # The method handler returned a ready-made Response, how nice of it
-            return result
-
-        status_code = HTTP_OK
-
-        if isinstance(result, tuple):
-            result, status_code = result
-
-        if isinstance(result, str):
-            result = result.encode("utf-8")
-        elif result is None:
-            result = b""
-        elif not isinstance(result, bytes):
-            assert (
-                False
-            ), f"Result should be None, string, bytes or Response. Got: {result}"
-
-        return web.Response(body=result, status=status_code)
+        return encode_result(result)
 
     return handle
+
+
+def encode_result(result):
+    """Take the result object a create web.StreamResponse out of it."""
+    if isinstance(result, web.StreamResponse):
+        # The method handler returned a ready-made Response, how nice of it
+        return result
+
+    status_code = HTTP_OK
+
+    if isinstance(result, tuple):
+        result, status_code = result
+
+    if isinstance(result, str):
+        result = result.encode("utf-8")
+    elif result is None:
+        result = b""
+    elif not isinstance(result, bytes):
+        assert False, "Result should be None, string, bytes or Response. Got: " + result
+
+    return web.Response(body=result, status=status_code)

@@ -1,4 +1,5 @@
 """Support for local control of entities by emulating a Philips Hue bridge."""
+from datetime import datetime
 import logging
 
 from aiohttp import web
@@ -12,15 +13,13 @@ import homeassistant.helpers.config_validation as cv
 from homeassistant.util.json import load_json, save_json
 
 from .hue_api import (
-    HueAllGroupsStateView,
-    HueAllLightsStateView,
-    HueConfigView,
     HueFullStateView,
     HueGroupView,
     HueOneLightChangeView,
     HueOneLightStateView,
     HueUnauthorizedUser,
     HueUsernameView,
+    HuePartialStateView,
 )
 from .upnp import DescriptionXmlView, UPNPResponderThread
 
@@ -29,6 +28,7 @@ DOMAIN = "emulated_hue"
 _LOGGER = logging.getLogger(__name__)
 
 NUMBERS_FILE = "emulated_hue_ids.json"
+WHITELISTED_USERS = "emulated_hue_users.json"
 
 CONF_ADVERTISE_IP = "advertise_ip"
 CONF_ADVERTISE_PORT = "advertise_port"
@@ -94,6 +94,18 @@ CONFIG_SCHEMA = vol.Schema(
 ATTR_EMULATED_HUE_NAME = "emulated_hue_name"
 
 
+def register_views(config, app):
+    """Register all views with the app."""
+    DescriptionXmlView(config).register(app, app.router)
+    HueUsernameView(config).register(app, app.router)
+    HueUnauthorizedUser(config).register(app, app.router)
+    HueOneLightStateView(config).register(app, app.router)
+    HueOneLightChangeView(config).register(app, app.router)
+    HueGroupView(config).register(app, app.router)
+    HueFullStateView(config).register(app, app.router)
+    HuePartialStateView(config).register(app, app.router)
+
+
 async def async_setup(hass, yaml_config):
     """Activate the emulated_hue component."""
     config = Config(hass, yaml_config.get(DOMAIN, {}))
@@ -111,16 +123,7 @@ async def async_setup(hass, yaml_config):
     runner = None
     site = None
 
-    DescriptionXmlView(config).register(app, app.router)
-    HueUsernameView().register(app, app.router)
-    HueUnauthorizedUser().register(app, app.router)
-    HueAllLightsStateView(config).register(app, app.router)
-    HueOneLightStateView(config).register(app, app.router)
-    HueOneLightChangeView(config).register(app, app.router)
-    HueAllGroupsStateView(config).register(app, app.router)
-    HueGroupView(config).register(app, app.router)
-    HueFullStateView(config).register(app, app.router)
-    HueConfigView(config).register(app, app.router)
+    register_views(config, app)
 
     upnp_listener = UPNPResponderThread(
         config.host_ip_addr,
@@ -173,6 +176,7 @@ class Config:
         self.hass = hass
         self.type = conf.get(CONF_TYPE)
         self.numbers = None
+        self.users = None
         self.cached_states = {}
 
         if self.type == TYPE_ALEXA:
@@ -235,6 +239,9 @@ class Config:
             hidden_value = self.entities[entity_id].get(CONF_ENTITY_HIDDEN)
             if hidden_value is not None:
                 self._entities_with_hidden_attr_in_config[entity_id] = hidden_value
+
+        # Load the whitelisted users database and cache the results.
+        self.users = _load_json(self.hass.config.path(WHITELISTED_USERS))
 
     def entity_id_to_number(self, entity_id):
         """Get a unique number for the entity id."""
@@ -299,6 +306,37 @@ class Config:
             return True
 
         return False
+
+    def get_whitelisted_users(self):
+        """Retrieve the dictonary of whitelisted users."""
+        return self.users
+
+    def create_whitelisted_user(self, username, name):
+        """Create a whitelisted users and save the database."""
+        self.users[username] = {
+            "name": name,
+            "last use date": datetime.now().isoformat(timespec="seconds"),
+            "create date": datetime.now().isoformat(timespec="seconds"),
+        }
+        self.flush_whitelisted_users()
+
+    def touch_whitelisted_user(self, username):
+        """Update the 'last use date' property of user in whitelisted database."""
+        self.users[username]["last use date"] = datetime.now().isoformat(
+            timespec="seconds"
+        )
+        self.flush_whitelisted_users()
+
+    def get_whitelisted_user(self, username):
+        """Retrieve the user from whiltelisted database."""
+        if username in self.users:
+            return self.users[username]
+
+        return None
+
+    def flush_whitelisted_users(self):
+        """Persist the collection of whitelisted users."""
+        save_json(self.hass.config.path(WHITELISTED_USERS), self.users)
 
 
 def _load_json(filename):

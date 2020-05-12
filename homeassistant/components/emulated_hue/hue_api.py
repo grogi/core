@@ -2,6 +2,10 @@
 import asyncio
 import hashlib
 import logging
+import re
+import uuid
+
+from getmac import get_mac_address
 
 from homeassistant import core
 from homeassistant.components import (
@@ -31,8 +35,6 @@ from homeassistant.components.fan import (
     SPEED_OFF,
     SUPPORT_SET_SPEED,
 )
-from homeassistant.components.http import HomeAssistantView
-from homeassistant.components.http.const import KEY_REAL_IP
 from homeassistant.components.light import (
     ATTR_BRIGHTNESS,
     ATTR_COLOR_TEMP,
@@ -49,9 +51,6 @@ from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_SUPPORTED_FEATURES,
     ATTR_TEMPERATURE,
-    HTTP_BAD_REQUEST,
-    HTTP_NOT_FOUND,
-    HTTP_UNAUTHORIZED,
     SERVICE_CLOSE_COVER,
     SERVICE_OPEN_COVER,
     SERVICE_TURN_OFF,
@@ -61,7 +60,13 @@ from homeassistant.const import (
     STATE_ON,
     STATE_UNAVAILABLE,
 )
-from homeassistant.util.network import is_local
+from .exceptions import (
+    BadRequest,
+    InvalidJson,
+    ResourceNotFound,
+    InvalidValueForParameter,
+)
+from .hue_api_view import HueApiView
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,7 +101,7 @@ UNAUTHORIZED_USER = [
 ]
 
 
-class HueUnauthorizedUser(HomeAssistantView):
+class HueUnauthorizedUser(HueApiView):
     """Handle requests to find the emulated hue bridge."""
 
     url = "/api"
@@ -109,7 +114,7 @@ class HueUnauthorizedUser(HomeAssistantView):
         return self.json(UNAUTHORIZED_USER)
 
 
-class HueUsernameView(HomeAssistantView):
+class HueUsernameView(HueApiView):
     """Handle requests to create a username for the emulated hue bridge."""
 
     url = "/api"
@@ -117,224 +122,127 @@ class HueUsernameView(HomeAssistantView):
     extra_urls = ["/api/"]
     requires_auth = False
 
+    regexp = re.compile("^[a-zA-Z0-9]+$")
+
     async def post(self, request):
         """Handle a POST request."""
-        if not is_local(request[KEY_REAL_IP]):
-            return self.json_message("Only local IPs allowed", HTTP_UNAUTHORIZED)
-
         try:
             data = await request.json()
         except ValueError:
-            return self.json_message("Invalid JSON", HTTP_BAD_REQUEST)
+            raise InvalidJson()
+
+        username = str(uuid.uuid4()).replace("-", "")
+        result = []
 
         if "devicetype" not in data:
-            return self.json_message("devicetype not specified", HTTP_BAD_REQUEST)
+            raise InvalidJson()
 
-        return self.json([{"success": {"username": HUE_API_USERNAME}}])
+        if "username" in data:
+            username_candidate = data["username"]
+            if self.regexp.match(username_candidate):
+                username = username_candidate
+            else:
+                result.append(
+                    {
+                        "error": {
+                            "type": 7,
+                            "address": "/username",
+                            "description": f"invalid value, {username_candidate}, for parameter, username",
+                        }
+                    }
+                )
+
+        result.append({"success": {"username": username}})
+
+        self.config.create_whitelisted_user(username, data["devicetype"])
+
+        return self.json(result)
 
 
-class HueAllGroupsStateView(HomeAssistantView):
-    """Handle requests for getting info about entity groups."""
-
-    url = "/api/{username}/groups"
-    name = "emulated_hue:all_groups:state"
-    requires_auth = False
-
-    def __init__(self, config):
-        """Initialize the instance of the view."""
-        self.config = config
-
-    @core.callback
-    def get(self, request, username):
-        """Process a request to make the Brilliant Lightpad work."""
-        if not is_local(request[KEY_REAL_IP]):
-            return self.json_message("Only local IPs allowed", HTTP_UNAUTHORIZED)
-
-        return self.json({})
-
-
-class HueGroupView(HomeAssistantView):
+class HueGroupView(HueApiView):
     """Group handler to get Logitech Pop working."""
 
     url = "/api/{username}/groups/0/action"
     name = "emulated_hue:groups:state"
     requires_auth = False
 
-    def __init__(self, config):
-        """Initialize the instance of the view."""
-        self.config = config
-
     @core.callback
+    # It is required for this code to be a method - the view is registered like that.
+    # pylint: disable=no-self-use
     def put(self, request, username):
         """Process a request to make the Logitech Pop working."""
-        if not is_local(request[KEY_REAL_IP]):
-            return self.json_message("Only local IPs allowed", HTTP_UNAUTHORIZED)
-
-        return self.json(
-            [
-                {
-                    "error": {
-                        "address": "/groups/0/action/scene",
-                        "type": 7,
-                        "description": "invalid value, dummy for parameter, scene",
-                    }
-                }
-            ]
-        )
+        raise InvalidValueForParameter("/groups/0/action/scene", "scene", "dummy")
 
 
-class HueAllLightsStateView(HomeAssistantView):
+class HuePartialStateView(HueApiView):
     """Handle requests for getting info about all entities."""
 
-    url = "/api/{username}/lights"
+    url = "/api/{username}/{model_name}"
     name = "emulated_hue:lights:state"
-    requires_auth = False
-
-    def __init__(self, config):
-        """Initialize the instance of the view."""
-        self.config = config
+    requires_auth = True
 
     @core.callback
-    def get(self, request, username):
+    def get(self, request, username, model_name):
         """Process a request to get the list of available lights."""
-        if not is_local(request[KEY_REAL_IP]):
-            return self.json_message("Only local IPs allowed", HTTP_UNAUTHORIZED)
+        result = create_model(self.config, request)[model_name]
 
-        return self.json(create_list_of_entities(self.config, request))
+        if result is None:
+            raise ResourceNotFound(f"Invalid resource name {model_name}.")
+
+        return self.json(result)
 
 
-class HueFullStateView(HomeAssistantView):
+class HueFullStateView(HueApiView):
     """Return full state view of emulated hue."""
 
     url = "/api/{username}"
     name = "emulated_hue:username:state"
-    requires_auth = False
-
-    def __init__(self, config):
-        """Initialize the instance of the view."""
-        self.config = config
+    requires_auth = True
 
     @core.callback
     def get(self, request, username):
         """Process a request to get the list of available lights."""
-        if not is_local(request[KEY_REAL_IP]):
-            return self.json_message("only local IPs allowed", HTTP_UNAUTHORIZED)
-        if username != HUE_API_USERNAME:
-            return self.json(UNAUTHORIZED_USER)
-
-        json_response = {
-            "lights": create_list_of_entities(self.config, request),
-            "config": create_config_model(self.config, request),
-        }
+        json_response = create_model(self.config, request)
 
         return self.json(json_response)
 
 
-class HueConfigView(HomeAssistantView):
-    """Return config view of emulated hue."""
-
-    url = "/api/{username}/config"
-    name = "emulated_hue:username:config"
-    requires_auth = False
-
-    def __init__(self, config):
-        """Initialize the instance of the view."""
-        self.config = config
-
-    @core.callback
-    def get(self, request, username):
-        """Process a request to get the configuration."""
-        if not is_local(request[KEY_REAL_IP]):
-            return self.json_message("only local IPs allowed", HTTP_UNAUTHORIZED)
-        if username != HUE_API_USERNAME:
-            return self.json(UNAUTHORIZED_USER)
-
-        json_response = create_config_model(self.config, request)
-
-        return self.json(json_response)
-
-
-class HueOneLightStateView(HomeAssistantView):
+class HueOneLightStateView(HueApiView):
     """Handle requests for getting info about a single entity."""
 
-    url = "/api/{username}/lights/{entity_id}"
+    url = "/api/{username}/lights/{entity_number}"
     name = "emulated_hue:light:state"
     requires_auth = False
 
-    def __init__(self, config):
-        """Initialize the instance of the view."""
-        self.config = config
-
     @core.callback
-    def get(self, request, username, entity_id):
+    def get(self, request, username, entity_number):
         """Process a request to get the state of an individual light."""
-        if not is_local(request[KEY_REAL_IP]):
-            return self.json_message("Only local IPs allowed", HTTP_UNAUTHORIZED)
-
-        hass = request.app["hass"]
-        hass_entity_id = self.config.number_to_entity_id(entity_id)
-
-        if hass_entity_id is None:
-            _LOGGER.error(
-                "Unknown entity number: %s not found in emulated_hue_ids.json",
-                entity_id,
-            )
-            return self.json_message("Entity not found", HTTP_NOT_FOUND)
-
-        entity = hass.states.get(hass_entity_id)
-
-        if entity is None:
-            _LOGGER.error("Entity not found: %s", hass_entity_id)
-            return self.json_message("Entity not found", HTTP_NOT_FOUND)
-
-        if not self.config.is_entity_exposed(entity):
-            _LOGGER.error("Entity not exposed: %s", entity_id)
-            return self.json_message("Entity not exposed", HTTP_UNAUTHORIZED)
+        entity, _ = self.get_hass_entity(request, entity_number)
 
         json_response = entity_to_json(self.config, entity)
 
         return self.json(json_response)
 
 
-class HueOneLightChangeView(HomeAssistantView):
+class HueOneLightChangeView(HueApiView):
     """Handle requests for setting info about entities."""
 
     url = "/api/{username}/lights/{entity_number}/state"
     name = "emulated_hue:light:state"
     requires_auth = False
 
-    def __init__(self, config):
-        """Initialize the instance of the view."""
-        self.config = config
-
     async def put(self, request, username, entity_number):
         """Process a request to set the state of an individual light."""
-        if not is_local(request[KEY_REAL_IP]):
-            return self.json_message("Only local IPs allowed", HTTP_UNAUTHORIZED)
-
+        hass = self.get_hass_app(request)
         config = self.config
-        hass = request.app["hass"]
-        entity_id = config.number_to_entity_id(entity_number)
 
-        if entity_id is None:
-            _LOGGER.error("Unknown entity number: %s", entity_number)
-            return self.json_message("Entity not found", HTTP_NOT_FOUND)
-
-        entity = hass.states.get(entity_id)
-
-        if entity is None:
-            _LOGGER.error("Entity not found: %s", entity_id)
-            return self.json_message("Entity not found", HTTP_NOT_FOUND)
-
-        if not config.is_entity_exposed(entity):
-            _LOGGER.error("Entity not exposed: %s", entity_id)
-            return self.json_message("Entity not exposed", HTTP_UNAUTHORIZED)
+        entity, entity_id = self.get_hass_entity(request, entity_number)
 
         try:
             request_json = await request.json()
         except ValueError:
             _LOGGER.error("Received invalid json")
-            return self.json_message("Invalid JSON", HTTP_BAD_REQUEST)
+            raise InvalidJson()
 
         # Get the entity's supported features
         entity_features = entity.attributes.get(ATTR_SUPPORTED_FEATURES, 0)
@@ -351,7 +259,7 @@ class HueOneLightChangeView(HomeAssistantView):
         if HUE_API_STATE_ON in request_json:
             if not isinstance(request_json[HUE_API_STATE_ON], bool):
                 _LOGGER.error("Unable to parse data: %s", request_json)
-                return self.json_message("Bad request", HTTP_BAD_REQUEST)
+                raise BadRequest()
             parsed[STATE_ON] = request_json[HUE_API_STATE_ON]
         else:
             parsed[STATE_ON] = entity.state != STATE_OFF
@@ -367,7 +275,7 @@ class HueOneLightChangeView(HomeAssistantView):
                     parsed[attr] = int(request_json[key])
                 except ValueError:
                     _LOGGER.error("Unable to parse data (2): %s", request_json)
-                    return self.json_message("Bad request", HTTP_BAD_REQUEST)
+                    raise BadRequest()
 
         if HUE_API_STATE_BRI in request_json:
             if entity.domain == light.DOMAIN:
@@ -736,6 +644,20 @@ def entity_to_json(config, entity):
     return retval
 
 
+def create_model(config, request):
+    """Create model for the /api/username resource."""
+    return {
+        "config": create_config_model(config, request),
+        "lights": create_list_of_entities(config, request),
+        "groups": create_list_of_groups(config, request),
+    }
+
+
+def create_list_of_groups(config, request):
+    """Create model for the /api/username/groups resource."""
+    return {}
+
+
 def create_hue_success_response(entity_number, attr, value):
     """Create a success response for an attribute set on a light."""
     success_key = f"/lights/{entity_number}/state/{attr}"
@@ -745,10 +667,10 @@ def create_hue_success_response(entity_number, attr, value):
 def create_config_model(config, request):
     """Create a config resource."""
     return {
-        "mac": "00:00:00:00:00:00",
+        "mac": get_mac_address(),
         "swversion": "01003542",
         "apiversion": "1.17.0",
-        "whitelist": {HUE_API_USERNAME: {"name": "HASS BRIDGE"}},
+        "whitelist": config.get_whitelisted_users(),
         "ipaddress": f"{config.advertise_ip}:{config.advertise_port}",
         "linkbutton": True,
     }

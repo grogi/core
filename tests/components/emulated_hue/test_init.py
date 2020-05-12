@@ -102,7 +102,10 @@ def test_config_google_home_entity_id_to_number_empty():
 
 def test_config_alexa_entity_id_to_number():
     """Test config adheres to the type."""
-    conf = Config(None, {"type": "alexa"})
+    mock_hass = Mock()
+    mock_hass.config.path.side_effect = "test.json"
+
+    conf = Config(mock_hass, {"type": "alexa"})
 
     number = conf.entity_id_to_number("light.test")
     assert number == "light.test"

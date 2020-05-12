@@ -1,10 +1,11 @@
 """The tests for the emulated Hue component."""
-from datetime import timedelta
+from datetime import timedelta, datetime
 from ipaddress import ip_address
 import json
-
 from aiohttp.hdrs import CONTENT_TYPE
 import pytest
+import os
+import re
 
 from homeassistant import const, setup
 from homeassistant.components import (
@@ -17,23 +18,17 @@ from homeassistant.components import (
     media_player,
     script,
 )
-from homeassistant.components.emulated_hue import Config
+from homeassistant.components.emulated_hue import Config, register_views
 from homeassistant.components.emulated_hue.hue_api import (
     HUE_API_STATE_BRI,
     HUE_API_STATE_HUE,
     HUE_API_STATE_ON,
     HUE_API_STATE_SAT,
     HUE_API_USERNAME,
-    HueAllGroupsStateView,
-    HueAllLightsStateView,
-    HueConfigView,
-    HueFullStateView,
-    HueOneLightChangeView,
-    HueOneLightStateView,
-    HueUsernameView,
 )
 from homeassistant.const import (
     ATTR_ENTITY_ID,
+    HTTP_BAD_REQUEST,
     HTTP_NOT_FOUND,
     HTTP_OK,
     HTTP_UNAUTHORIZED,
@@ -42,13 +37,15 @@ from homeassistant.const import (
     STATE_OFF,
     STATE_ON,
 )
+
 import homeassistant.util.dt as dt_util
 
-from tests.async_mock import patch
+from tests.async_mock import patch, Mock
 from tests.common import (
     async_fire_time_changed,
     async_mock_service,
     get_test_instance_port,
+    get_test_config_dir,
 )
 
 HTTP_SERVER_PORT = get_test_instance_port()
@@ -56,6 +53,7 @@ BRIDGE_SERVER_PORT = get_test_instance_port()
 
 BRIDGE_URL_BASE = f"http://127.0.0.1:{BRIDGE_SERVER_PORT}" + "{}"
 JSON_HEADERS = {CONTENT_TYPE: const.CONTENT_TYPE_JSON}
+TEST_HUE_DEVICETYPE = "hass_testing#test_hue_api.py"
 
 ENTITY_IDS_BY_NUMBER = {
     "1": "light.ceiling_lights",
@@ -163,9 +161,13 @@ def hass_hue(loop, hass):
 @pytest.fixture
 def hue_client(loop, hass_hue, aiohttp_client):
     """Create web client for emulated hue api."""
+
+    mock_hass = Mock()
+    mock_hass.config.path.side_effect = lambda p: os.path.join(get_test_config_dir(), p)
+
     web_app = hass_hue.http.app
     config = Config(
-        None,
+        mock_hass,
         {
             emulated_hue.CONF_ENTITIES: {
                 "light.bed_light": {emulated_hue.CONF_ENTITY_HIDDEN: True},
@@ -186,20 +188,15 @@ def hue_client(loop, hass_hue, aiohttp_client):
     )
     config.numbers = ENTITY_IDS_BY_NUMBER
 
-    HueUsernameView().register(web_app, web_app.router)
-    HueAllLightsStateView(config).register(web_app, web_app.router)
-    HueOneLightStateView(config).register(web_app, web_app.router)
-    HueOneLightChangeView(config).register(web_app, web_app.router)
-    HueAllGroupsStateView(config).register(web_app, web_app.router)
-    HueFullStateView(config).register(web_app, web_app.router)
-    HueConfigView(config).register(web_app, web_app.router)
+    register_views(config, web_app)
 
     return loop.run_until_complete(aiohttp_client(web_app))
 
 
 async def test_discover_lights(hue_client):
     """Test the discovery of lights."""
-    result = await hue_client.get("/api/username/lights")
+    username = await get_api_username(hue_client)
+    result = await hue_client.get(f"/api/{username}/lights")
 
     assert result.status == HTTP_OK
     assert "application/json" in result.headers["content-type"]
@@ -312,9 +309,57 @@ async def test_reachable_for_state(hass_hue, hue_client, state, is_reachable):
     assert state_json["state"]["reachable"] == is_reachable, state_json
 
 
+def validate_date_iso8601(str):
+    """Validate if the string is a valid ISO8601 datetime string."""
+    try:
+        datetime.fromisoformat(str)
+    except ValueError:
+        return False
+    return True
+
+
+def validate_config_object(config_json, username):
+    """Validate the config object returned from API."""
+    # Make sure array is correct size
+    assert len(config_json) == 6
+
+    mac_regex = re.compile(r"^([a-f0-9]{2}\:){5}([a-f0-9]{2})$", re.IGNORECASE)
+
+    # Make sure the config wrapper added to the config is there
+    assert "mac" in config_json
+    assert mac_regex.match(config_json["mac"])
+
+    # Make sure the correct version in config
+    assert "swversion" in config_json
+    assert "01003542" in config_json["swversion"]
+
+    # Make sure the api version is correct
+    assert "apiversion" in config_json
+    assert "1.17.0" in config_json["apiversion"]
+
+    # Make sure the correct username in config
+    assert "whitelist" in config_json
+    assert username in config_json["whitelist"]
+    assert "name" in config_json["whitelist"][username]
+    assert config_json["whitelist"][username]["name"] == TEST_HUE_DEVICETYPE
+    assert "create date" in config_json["whitelist"][username]
+    assert "last use date" in config_json["whitelist"][username]
+    assert validate_date_iso8601(config_json["whitelist"][username]["create date"])
+    assert validate_date_iso8601(config_json["whitelist"][username]["last use date"])
+
+    # Make sure the correct ip in config
+    assert "ipaddress" in config_json
+    assert "127.0.0.1:8300" in config_json["ipaddress"]
+
+    # Make sure the device announces a link button
+    assert "linkbutton" in config_json
+    assert config_json["linkbutton"] is True
+
+
 async def test_discover_full_state(hue_client):
     """Test the discovery of full state."""
-    result = await hue_client.get(f"/api/{HUE_API_USERNAME}")
+    username = await get_api_username(hue_client)
+    result = await hue_client.get(f"/api/{username}")
 
     assert result.status == HTTP_OK
     assert "application/json" in result.headers["content-type"]
@@ -330,75 +375,24 @@ async def test_discover_full_state(hue_client):
     lights_json = result_json["lights"]
     config_json = result_json["config"]
 
+    validate_config_object(config_json, username)
+
     # Make sure array is correct size
-    assert len(result_json) == 2
-    assert len(config_json) == 6
+    assert len(result_json) >= 2
     assert len(lights_json) >= 1
-
-    # Make sure the config wrapper added to the config is there
-    assert "mac" in config_json
-    assert "00:00:00:00:00:00" in config_json["mac"]
-
-    # Make sure the correct version in config
-    assert "swversion" in config_json
-    assert "01003542" in config_json["swversion"]
-
-    # Make sure the api version is correct
-    assert "apiversion" in config_json
-    assert "1.17.0" in config_json["apiversion"]
-
-    # Make sure the correct username in config
-    assert "whitelist" in config_json
-    assert HUE_API_USERNAME in config_json["whitelist"]
-    assert "name" in config_json["whitelist"][HUE_API_USERNAME]
-    assert "HASS BRIDGE" in config_json["whitelist"][HUE_API_USERNAME]["name"]
-
-    # Make sure the correct ip in config
-    assert "ipaddress" in config_json
-    assert "127.0.0.1:8300" in config_json["ipaddress"]
-
-    # Make sure the device announces a link button
-    assert "linkbutton" in config_json
-    assert config_json["linkbutton"] is True
 
 
 async def test_discover_config(hue_client):
     """Test the discovery of configuration."""
-    result = await hue_client.get(f"/api/{HUE_API_USERNAME}/config")
+    username = await get_api_username(hue_client)
+    result = await hue_client.get(f"/api/{username}/config")
 
     assert result.status == 200
     assert "application/json" in result.headers["content-type"]
 
     config_json = await result.json()
 
-    # Make sure array is correct size
-    assert len(config_json) == 6
-
-    # Make sure the config wrapper added to the config is there
-    assert "mac" in config_json
-    assert "00:00:00:00:00:00" in config_json["mac"]
-
-    # Make sure the correct version in config
-    assert "swversion" in config_json
-    assert "01003542" in config_json["swversion"]
-
-    # Make sure the api version is correct
-    assert "apiversion" in config_json
-    assert "1.17.0" in config_json["apiversion"]
-
-    # Make sure the correct username in config
-    assert "whitelist" in config_json
-    assert HUE_API_USERNAME in config_json["whitelist"]
-    assert "name" in config_json["whitelist"][HUE_API_USERNAME]
-    assert "HASS BRIDGE" in config_json["whitelist"][HUE_API_USERNAME]["name"]
-
-    # Make sure the correct ip in config
-    assert "ipaddress" in config_json
-    assert "127.0.0.1:8300" in config_json["ipaddress"]
-
-    # Make sure the device announces a link button
-    assert "linkbutton" in config_json
-    assert config_json["linkbutton"] is True
+    validate_config_object(config_json, username)
 
 
 async def test_get_light_state(hass_hue, hue_client):
@@ -425,7 +419,8 @@ async def test_get_light_state(hass_hue, hue_client):
     assert office_json["state"][HUE_API_STATE_SAT] == 217
 
     # Check all lights view
-    result = await hue_client.get("/api/username/lights")
+    username = await get_api_username(hue_client)
+    result = await hue_client.get(f"/api/{username}/lights")
 
     assert result.status == HTTP_OK
     assert "application/json" in result.headers["content-type"]
@@ -856,7 +851,8 @@ async def test_proper_put_state_request(hue_client):
 async def test_get_empty_groups_state(hue_client):
     """Test the request to get groups endpoint."""
     # Test proper on value parsing
-    result = await hue_client.get("/api/username/groups")
+    username = await get_api_username(hue_client)
+    result = await hue_client.get(f"/api/{username}/groups")
 
     assert result.status == HTTP_OK
 
@@ -901,8 +897,9 @@ async def perform_put_test_on_ceiling_lights(
 
 async def perform_get_light_state(client, entity_id, expected_status):
     """Test the getting of a light state."""
+    username = await get_api_username(client)
     entity_number = ENTITY_NUMBERS_BY_ID[entity_id]
-    result = await client.get(f"/api/username/lights/{entity_number}")
+    result = await client.get(f"/api/{username}/lights/{entity_number}")
 
     assert result.status == expected_status
 
@@ -989,3 +986,98 @@ async def test_unauthorized_user_blocked(hue_client):
 
         result_json = await result.json()
         assert result_json[0]["error"]["description"] == "unauthorized user"
+
+
+async def call_username_api(hue_client, device_type, prefered_username):
+    """Execute call to username api and parse the result."""
+    postUrl = "/api"
+
+    data = {}
+
+    if device_type is not None:
+        data["devicetype"] = device_type
+
+    if prefered_username is not None:
+        data["username"] = prefered_username
+
+    response = await hue_client.post(
+        postUrl,
+        data=json.dumps(data).encode(),
+        headers={CONTENT_TYPE: "application/x-www-form-urlencoded"},
+    )
+
+    username = None
+    errors = []
+
+    response_array = await response.json()
+
+    for response_item in response_array:
+        if "success" in response_item.keys():
+            if "username" in response_item["success"].keys():
+                username = response_item["success"]["username"]
+            else:
+                assert False, "emulated_hue returned success, but no username returned."
+        if "error" in response_item.keys():
+            errors.append(response_item["error"])
+
+    return (username, errors, response.status)
+
+
+async def get_api_username(
+    hue_client, device_type=TEST_HUE_DEVICETYPE, prefered_username=HUE_API_USERNAME
+):
+    """Connect to the hue to create API user."""
+    username, errors, status_code = await call_username_api(
+        hue_client, device_type, prefered_username
+    )
+
+    assert username is not None, "The emulated_hue did not return a username to use."
+    return username
+
+
+async def test_create_user(hue_client):
+    """Test if user is successfully created."""
+    username, errors, status = await call_username_api(hue_client, "myAndroid", None)
+
+    assert username is not None
+    assert len(errors) == 0
+    assert status == HTTP_OK
+
+
+async def test_create_user_given_name(hue_client):
+    """Test if user is successfully created if username property provided in the request."""
+    username, errors, status = await call_username_api(
+        hue_client, "myIpad", "myIpadUsername"
+    )
+
+    assert username == "myIpadUsername"
+    assert len(errors) == 0
+    assert status == HTTP_OK
+
+
+async def test_create_user_invalid_given_name(hue_client):
+    """Test if user is successfully created if invalid username provided in the request."""
+    username, errors, status = await call_username_api(
+        hue_client, "myIpad", "silly name"
+    )
+
+    assert username is not None
+    assert len(errors) == 1
+    assert status == HTTP_OK
+    assert errors[0]["type"] == 7
+    assert errors[0]["address"] == "/username"
+    assert (
+        errors[0]["description"] == "invalid value, silly name, for parameter, username"
+    )
+
+
+async def test_create_no_devicetype(hue_client):
+    """Test if request is rejected if no devicetype is provided."""
+    username, errors, status = await call_username_api(hue_client, None, None)
+
+    assert username is None
+    assert len(errors) == 1
+    assert status == HTTP_BAD_REQUEST
+    assert errors[0]["type"] == 2
+    assert errors[0]["address"] == "/"
+    assert errors[0]["description"] == "body contains invalid json"

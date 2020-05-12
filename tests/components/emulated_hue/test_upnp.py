@@ -103,10 +103,10 @@ class TestEmulatedHue(unittest.TestCase):
         assert len(error_json) == 3
         assert "/" in error_json["address"]
         assert "unauthorized user" in error_json["description"]
-        assert "1" in error_json["type"]
+        assert error_json["type"] == 1
 
-    def test_valid_username_request(self):
-        """Test request with a valid username."""
+    def test_invalid_request_no_devicetype_given(self):
+        """Test request without a valid devicetype."""
         request_json = {"invalid_key": "my_device"}
 
         result = requests.post(
